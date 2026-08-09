@@ -19,8 +19,8 @@ module lphy_d2c_cal #(
     input  wire  [15:0] error_threshold,    // Max allowed errors to consider a phase "passing"
     
     // Data stream from RX Mainband (Parallel 8-bit Arrays)
-    input  wire [7:0]  rx_data [NUM_LANES-1:0], 
-    input  wire [7:0]  expected_data [NUM_LANES-1:0], 
+    input  logic [7:0]  rx_data [NUM_LANES-1:0], 
+    input  logic [7:0]  expected_data [NUM_LANES-1:0], 
     
     // Calibration Outputs to Analog Front End (AFE) and LTSSM
     output logic [5:0]  pi_phase,           // Controls the physical Phase Interpolator
@@ -54,7 +54,7 @@ module lphy_d2c_cal #(
     logic [5:0]  first_eye_right;
     logic        first_eye_closed;
     logic        phase_0_passed;
-    logic        phase_63_passed;
+    logic        phase_max_passed;
     
     // Combinatorial mismatch detector for the 2D arrays
     logic cycle_has_error;
@@ -82,7 +82,7 @@ module lphy_d2c_cal #(
             first_eye_right  <= '0;
             first_eye_closed <= 1'b0;
             phase_0_passed   <= 1'b0;
-            phase_63_passed  <= 1'b0;
+            phase_max_passed <= 1'b0;
         end else begin
             state <= next_state;
             
@@ -99,7 +99,7 @@ module lphy_d2c_cal #(
                     first_eye_right  <= '0;
                     first_eye_closed <= 1'b0;
                     phase_0_passed   <= 1'b0;
-                    phase_63_passed  <= 1'b0;
+                    phase_max_passed <= 1'b0;
                 end
                 
                 ST_SET_PHASE: begin
@@ -131,8 +131,8 @@ module lphy_d2c_cal #(
                         eye_found  <= 1'b1;
                         
                         // Flag the outer boundaries for stitching
-                        if (current_phase == 6'd0)  phase_0_passed <= 1'b1;
-                        if (current_phase == 6'd63) phase_63_passed <= 1'b1;
+                        if (current_phase == 6'd0)              phase_0_passed   <= 1'b1;
+                        if (current_phase == PI_PHASE_MAX[5:0]) phase_max_passed <= 1'b1;
                     end else begin
                         // Phase failed
                         if (in_eye) begin
@@ -151,18 +151,10 @@ module lphy_d2c_cal #(
                 
                 ST_CALC_CENTER: begin
                     if (eye_found) begin
-                        if (phase_0_passed && phase_63_passed) begin
+                        if (phase_0_passed && phase_max_passed) begin
                             // Circular Math: The eye wrapped the boundary!
-                            // left_edge = start of the last piece (e.g. 50)
-                            // first_eye_right = end of the first piece (e.g. 10)
-                            logic [6:0] wrapped_width;
-                            logic [6:0] center_calc;
-                            
-                            wrapped_width = (7'd64 - {1'b0, left_edge}) + {1'b0, first_eye_right};
-                            center_calc   = {1'b0, left_edge} + (wrapped_width >> 1);
-                            
-                            // Modulo 64 via bit-masking
-                            pi_phase <= center_calc[5:0];
+                            // Using a single line with Modulo prevents simulator scoping bugs.
+                            pi_phase <= (left_edge + ((7'd64 - left_edge + first_eye_right) >> 1)) % 64;
                         end else begin
                             // Standard contiguous eye
                             pi_phase <= left_edge + ((right_edge - left_edge) >> 1);
