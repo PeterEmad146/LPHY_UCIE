@@ -19,8 +19,8 @@ module lphy_d2c_cal #(
     input  wire  [15:0] error_threshold,    // Max allowed errors to consider a phase "passing"
     
     // Data stream from RX Mainband (Parallel 8-bit Arrays)
-    input  logic [7:0]  rx_data [NUM_LANES-1:0], 
-    input  logic [7:0]  expected_data [NUM_LANES-1:0], 
+    input  wire [7:0]  rx_data [NUM_LANES-1:0], 
+    input  wire [7:0]  expected_data [NUM_LANES-1:0], 
     
     // Calibration Outputs to Analog Front End (AFE) and LTSSM
     output logic [5:0]  pi_phase,           // Controls the physical Phase Interpolator

@@ -6,8 +6,8 @@
 /// redundant analog bumps (TRDVLD / RRDVLD) if the primary valid pin fails.
 module lphy_valid_repair (
     // Logical Signals (From/To internal PHY Logic, 8-bit Parallel)
-    input  logic [7:0] tvld_l, 
-    input  logic [7:0] trdvld_l,
+    input  wire [7:0] tvld_l, 
+    input  wire [7:0] trdvld_l,
     
     output logic [7:0] rvld_l, 
     output logic [7:0] rrdvld_l, 
@@ -16,13 +16,13 @@ module lphy_valid_repair (
     output logic [7:0] tvld_p, 
     output logic [7:0] trdvld_p,  // Transmit Redundant Valid
     
-    input  logic [7:0] rvld_p, 
-    input  logic [7:0] rrdvld_p,  // Receive Redundant Valid
+    input  wire [7:0] rvld_p, 
+    input  wire [7:0] rrdvld_p,  // Receive Redundant Valid
     
     // Repair Encodings from Data Repair Controller
     // 2'h3: No Repair, 2'h0: TVLD_P Repaired
-    input  logic [1:0] tx_repair_addr, 
-    input  logic [1:0] rx_repair_addr
+    input  wire [1:0] tx_repair_addr, 
+    input  wire [1:0] rx_repair_addr
 );
 
     // -----------------------------------------------------------------
