@@ -4,6 +4,7 @@
 /// @title UCIe Mainband RX Top Wrapper
 /// @description Integrates the AFE pipeline, Repair Demux, Reversal Detector, 
 /// Valid Deframer, Descrambler, and Data Demapper to drive the Adapter.
+/// (Optimized with 8-Quadrant Replication and Boundary Pipelining for 2GHz closure)
 module lphy_rx_top #(
     parameter int NUM_LANES = 64    // 16 for Standard Package, 64 for Advanced Package
 )(
@@ -81,6 +82,31 @@ module lphy_rx_top #(
         else        internal_lane_valid_q <= internal_lane_valid;
     end
     
+    // =========================================================================
+    // PIPELINE STAGE 1: Control Signal 8-Quadrant Replication Tree
+    // =========================================================================
+    // Kills the massive WLM fanout penalty by splitting the load into 8 independent chunks
+    (* dont_touch = "true" *) logic [7:0] pipe_rx_training_en;
+    (* dont_touch = "true" *) logic [7:0] pipe_descrambler_en;
+    (* dont_touch = "true" *) logic [7:0] pipe_load_seed;
+    (* dont_touch = "true" *) logic [7:0] pipe_lane_valid;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pipe_rx_training_en <= 8'h0;
+            pipe_descrambler_en <= 8'h0;
+            pipe_load_seed      <= 8'h0;
+            pipe_lane_valid     <= 8'h0;
+        end else begin
+            for (int i = 0; i < 8; i++) begin
+                pipe_rx_training_en[i] <= rx_training_en;
+                pipe_descrambler_en[i] <= descrambler_en;
+                pipe_load_seed[i]      <= load_seed;
+                pipe_lane_valid[i]     <= internal_lane_valid;
+            end
+        end
+    end
+
     // =========================================================================
     // 1. AFE PIPELINE LATCH 
     // =========================================================================
@@ -170,28 +196,6 @@ module lphy_rx_top #(
         .framing_err(internal_framing_err)
     );
     
-    // Align valid signals with the Derotator flop
-    logic pl_valid_reg;
-    logic pl_credit_return_reg;
-    logic pl_framing_err_reg;
-    
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            pl_valid_reg         <= 1'b0;
-            pl_credit_return_reg <= 1'b0;
-            pl_framing_err_reg   <= 1'b0;
-        end else begin
-            pl_valid_reg         <= internal_lane_valid;
-            pl_credit_return_reg <= internal_credit_return;
-            pl_framing_err_reg   <= internal_framing_err;
-        end
-    end
-    
-    // Hide adapter valid if we are in training mode
-    assign pl_valid      = rx_training_en ? 1'b0 : pl_valid_reg;
-    assign credit_return = pl_credit_return_reg;
-    assign framing_err   = pl_framing_err_reg;
-    
     // =========================================================================
     // 6. LANE DEROTATOR & DESKEW
     // =========================================================================
@@ -213,18 +217,19 @@ module lphy_rx_top #(
     // =========================================================================
     // 7. DESCRAMBLER ARRAY
     // =========================================================================
-    // Spec Rule: Initialization Patterns must NOT be descrambled.
-    wire descrambler_fire = descrambler_en & pl_valid_reg & ~rx_training_en;
     wire [7:0] descrambled_data [63:0];
     
     genvar i; 
     generate
         for (i = 0; i < 64; i++) begin : gen_descramblers
+            // Uses the replicated quadrant logic to kill fanout penalty
+            wire descrambler_fire = pipe_descrambler_en[i/8] & pipe_lane_valid[i/8] & ~pipe_rx_training_en[i/8];
+
             lphy_descrambler descrambler_inst (
                 .clk(clk), 
                 .rst_n(rst_n), 
                 .enable(descrambler_fire), 
-                .load_seed(load_seed), 
+                .load_seed(pipe_load_seed[i/8]), 
                 .seed_in(lane_seeds[i]), 
                 .data_in(derotated_data[i]), 
                 .data_out(descrambled_data[i])
@@ -233,14 +238,27 @@ module lphy_rx_top #(
     endgenerate
     
     // =========================================================================
-    // 8. LANE-TO-BYTE DEMAPPER (Adapter Payload Reconstruction)
+    // 8. RDI BOUNDARY PIPELINE (Adapter Payload & Status Alignment)
     // =========================================================================
-    // Combines the active lanes into a flat 512-bit vector.
-    // If x32 or x16 degraded mode is active, the data arrives sequentially over 
-    // multiple cycles. (Simplified for this wrapper scope to direct passthrough).
-    always_comb begin
+    // Registering the outputs stops Design Compiler from assessing the 0.20ns 
+    // set_output_delay constraint against our internal logic, sealing the 2GHz path.
+    
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pl_valid      <= 1'b0;
+            credit_return <= 1'b0;
+            framing_err   <= 1'b0;
+        end else begin
+            pl_valid      <= pipe_rx_training_en[0] ? 1'b0 : pipe_lane_valid[0];
+            credit_return <= internal_credit_return;
+            framing_err   <= internal_framing_err;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        // No reset needed for massive 512-bit datapath pipeline
         for (int j = 0; j < 64; j++) begin
-            pl_data[j*8 +: 8] = descrambled_data[j];
+            pl_data[j*8 +: 8] <= descrambled_data[j];
         end
     end
     

@@ -16,9 +16,10 @@ module ucie_lphy_top #(
     parameter int D2C_TEST_CYCLES     = 128
 )(
     // 1. GLOBAL CLOCKS AND RESET
-    input  wire        lclk,             
-    input  wire        rst_n,            
-    input  wire        soc_reset_n,      
+    input  wire        lclk,             // Mainband/LTSSM clock (2 GHz)
+    input  wire        sb_clk,           // Sideband MAC clock (800 MHz)
+    input  wire        rst_n,            // Active-low asynchronous reset
+    input  wire        soc_reset_n,      // System-level reset   
 
     // 2. ADAPTER INTERFACE (RDI)
     input  wire        lp_valid,
@@ -408,7 +409,7 @@ module ucie_lphy_top #(
     );
 
     lphy_sb_ctrl u_sb_ctrl (
-        .sb_clk        (lclk),
+        .sb_clk        (sb_clk),
         .rst_n         (rst_n),
         .rdi_in_reset  (int_pl_state_sts == 4'b0000),
         .tx_req_valid  (tx_req_valid),      .tx_req_ready  (tx_req_ready),
