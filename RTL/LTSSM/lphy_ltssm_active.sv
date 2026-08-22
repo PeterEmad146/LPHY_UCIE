@@ -2,20 +2,19 @@
 `timescale 1ns / 1ps
 
 /// @title UCIe LTSSM Active State Controller
-/// @description Orchestrates the fully operational link state. Enforces mandatory
-/// mainband scrambling, reports status to RDI, and coordinates sideband handshakes
-/// for exiting to Power Management (L1/L2), Retrain, Reset, Disable, or LinkError.
+/// @description Orchestrates the fully operational link state. 
+/// (Optimized with Full I/O Boundary Shielding for 2GHz Timing Closure)
 module lphy_ltssm_active (
     input  wire        clk, 
     input  wire        rst_n, 
-    input  wire        en_active,           // Triggered by exit from LINKINIT state
+    input  wire        en_active,           
     
     // Adapter Interface (RDI) 
-    input  wire [3:0]  lp_state_req,        // 0100b: L1, 1000b: L2, 1001b: LinkReset, 1011b: Retrain, 1100b: Disabled
-    input  wire        lp_linkerror,        // Immediate transition to LinkError
-    output logic [3:0] pl_state_sts,        // Tell Adapter we are in ACTIVE (0001b)
+    input  wire [3:0]  lp_state_req,        
+    input  wire        lp_linkerror,        
+    output logic [3:0] pl_state_sts,        
     
-    // Handshake Status Inputs from Sideband RX (1-Cycle Pulses)
+    // Handshake Status Inputs from Sideband RX 
     input  wire        rx_req_l1,        input wire rx_rsp_l1,
     input  wire        rx_req_l2,        input wire rx_rsp_l2,
     input  wire        rx_req_linkreset, input wire rx_rsp_linkreset,
@@ -23,7 +22,7 @@ module lphy_ltssm_active (
     input  wire        rx_req_retrain,   input wire rx_rsp_retrain,
     input  wire        rx_req_linkerror, 
     
-    // Handshake Triggers to Sideband TX (1-Cycle Pulses)
+    // Handshake Triggers to Sideband TX 
     output logic       tx_req_l1,        output logic tx_rsp_l1,
     output logic       tx_req_l2,        output logic tx_rsp_l2,
     output logic       tx_req_linkreset, output logic tx_rsp_linkreset,
@@ -33,13 +32,13 @@ module lphy_ltssm_active (
     
     // Internal PHY Triggers
     input  wire        internal_retrain_req, 
-    input  wire        internal_error_req,  // Triggered by uncorrectable PHY faults
+    input  wire        internal_error_req,  
     
     // Status Logging Output
-    output logic [7:0] active_log,          // Output to Error Log 0 Register (15h)
+    output logic [7:0] active_log,          
     
     // State Machine Exits & Control
-    output logic        scrambling_en,       // Mandatory LFSR scrambling during ACTIVE
+    output logic       scrambling_en,       
     output logic       exit_to_l1, 
     output logic       exit_to_l2, 
     output logic       exit_to_linkreset, 
@@ -50,14 +49,62 @@ module lphy_ltssm_active (
 
     typedef enum logic [1:0] {
         ST_ACTIVE_STEADY = 2'b00,
-        ST_WAIT_RSP      = 2'b01,  // We asked to leave, waiting for remote permission
+        ST_WAIT_RSP      = 2'b01,  
         ST_EXITING       = 2'b10
     } state_t;
     
-    state_t state, next_state;
-    
-    // Latches to remember what state we are trying to exit to
+    (* fsm_encoding = "one_hot" *) state_t state, next_state;
     logic [3:0] target_exit_state; 
+
+    // =========================================================================
+    // 1. INPUT BOUNDARY SHIELD (Flop-In)
+    // Absorbs external timing delays before evaluating the priority tree
+    // =========================================================================
+    (* dont_touch = "true" *) logic       en_active_q;
+    (* dont_touch = "true" *) logic [3:0] lp_state_req_q;
+    (* dont_touch = "true" *) logic       lp_linkerror_q;
+    
+    (* dont_touch = "true" *) logic rx_req_l1_q,        rx_rsp_l1_q;
+    (* dont_touch = "true" *) logic rx_req_l2_q,        rx_rsp_l2_q;
+    (* dont_touch = "true" *) logic rx_req_linkreset_q, rx_rsp_linkreset_q;
+    (* dont_touch = "true" *) logic rx_req_disable_q,   rx_rsp_disable_q;
+    (* dont_touch = "true" *) logic rx_req_retrain_q,   rx_rsp_retrain_q;
+    (* dont_touch = "true" *) logic rx_req_linkerror_q;
+    
+    (* dont_touch = "true" *) logic internal_retrain_req_q;
+    (* dont_touch = "true" *) logic internal_error_req_q;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            en_active_q            <= 1'b0;
+            lp_state_req_q         <= 4'h0;
+            lp_linkerror_q         <= 1'b0;
+            
+            rx_req_l1_q            <= 1'b0; rx_rsp_l1_q        <= 1'b0;
+            rx_req_l2_q            <= 1'b0; rx_rsp_l2_q        <= 1'b0;
+            rx_req_linkreset_q     <= 1'b0; rx_rsp_linkreset_q <= 1'b0;
+            rx_req_disable_q       <= 1'b0; rx_rsp_disable_q   <= 1'b0;
+            rx_req_retrain_q       <= 1'b0; rx_rsp_retrain_q   <= 1'b0;
+            rx_req_linkerror_q     <= 1'b0;
+            
+            internal_retrain_req_q <= 1'b0;
+            internal_error_req_q   <= 1'b0;
+        end else begin
+            en_active_q            <= en_active;
+            lp_state_req_q         <= lp_state_req;
+            lp_linkerror_q         <= lp_linkerror;
+            
+            rx_req_l1_q            <= rx_req_l1;        rx_rsp_l1_q        <= rx_rsp_l1;
+            rx_req_l2_q            <= rx_req_l2;        rx_rsp_l2_q        <= rx_rsp_l2;
+            rx_req_linkreset_q     <= rx_req_linkreset; rx_rsp_linkreset_q <= rx_rsp_linkreset;
+            rx_req_disable_q       <= rx_req_disable;   rx_rsp_disable_q   <= rx_rsp_disable;
+            rx_req_retrain_q       <= rx_req_retrain;   rx_rsp_retrain_q   <= rx_rsp_retrain;
+            rx_req_linkerror_q     <= rx_req_linkerror;
+            
+            internal_retrain_req_q <= internal_retrain_req;
+            internal_error_req_q   <= internal_error_req;
+        end
+    end
     
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -66,38 +113,28 @@ module lphy_ltssm_active (
         end else begin
             state <= next_state;
             
-            if (!en_active) begin
+            if (!en_active_q) begin
                 target_exit_state <= 4'h0;
             end else if (state == ST_ACTIVE_STEADY) begin
-                // Latch Remote Requests first (highest priority)
-                if (rx_req_disable)           target_exit_state <= 4'b1100;
-                else if (rx_req_linkreset)    target_exit_state <= 4'b1001;
-                else if (rx_req_retrain)      target_exit_state <= 4'b1011;
-                else if (rx_req_l1)           target_exit_state <= 4'b0100;
-                else if (rx_req_l2)           target_exit_state <= 4'b1000;
+                // Evaluate strictly using the shielded registers!
+                if (rx_req_disable_q)           target_exit_state <= 4'b1100;
+                else if (rx_req_linkreset_q)    target_exit_state <= 4'b1001;
+                else if (rx_req_retrain_q)      target_exit_state <= 4'b1011;
+                else if (rx_req_l1_q)           target_exit_state <= 4'b0100;
+                else if (rx_req_l2_q)           target_exit_state <= 4'b1000;
                 
-                // Then Local Requests from RDI Adapter or Internal PHY monitors
-                else if (lp_state_req == 4'b1100) target_exit_state <= 4'b1100; // Disable
-                else if (lp_state_req == 4'b1001) target_exit_state <= 4'b1001; // LinkReset
-                else if (lp_state_req == 4'b1011 || internal_retrain_req) target_exit_state <= 4'b1011; // Retrain
-                else if (lp_state_req == 4'b0100) target_exit_state <= 4'b0100; // L1
-                else if (lp_state_req == 4'b1000) target_exit_state <= 4'b1000; // L2
+                else if (lp_state_req_q == 4'b1100) target_exit_state <= 4'b1100; 
+                else if (lp_state_req_q == 4'b1001) target_exit_state <= 4'b1001; 
+                else if (lp_state_req_q == 4'b1011 || internal_retrain_req_q) target_exit_state <= 4'b1011; 
+                else if (lp_state_req_q == 4'b0100) target_exit_state <= 4'b0100; 
+                else if (lp_state_req_q == 4'b1000) target_exit_state <= 4'b1000; 
             end
         end
     end
 
     // =========================================================================
-    // HANDSHAKE ARBITRATION (Balanced priority tree, replaces serial if/else-if)
+    // HANDSHAKE ARBITRATION 
     // =========================================================================
-    // The original ST_ACTIVE_STEADY block picked a winner from 10 mutually
-    // exclusive conditions (5 remote requests, then 5 local requests) using a
-    // linear if/else-if chain. That's a genuine 10-level serial dependency
-    // (to grant a low-priority request you must first disprove every
-    // higher-priority one), which alone (~0.6 ns) already blew the ~0.46 ns
-    // per-cycle budget at 2 GHz -- before even considering the extra module
-    // hops downstream. Rebuilt below as a 16-bit request vector (in priority
-    // order, zero-padded) resolved by a balanced priority-encoder tree
-    // (depth ~4 instead of ~10).
     localparam int WIN_DISABLE = 0, WIN_LINKRESET = 1, WIN_RETRAIN = 2,
                    WIN_L1 = 3, WIN_L2 = 4, WIN_LP_DISABLE = 5,
                    WIN_LP_LINKRESET = 6, WIN_LP_RETRAIN = 7,
@@ -110,10 +147,8 @@ module lphy_ltssm_active (
     function automatic void find_first_one16(input  logic [15:0] vec,
                                               output logic [3:0]  idx,
                                               output logic        valid);
-        logic [1:0] n_idx [0:3];
-        logic       n_val [0:3];
-        logic [2:0] g_idx [0:1];
-        logic       g_val [0:1];
+        logic [1:0] n_idx [0:3]; logic n_val [0:3];
+        logic [2:0] g_idx [0:1]; logic g_val [0:1];
         int i;
         for (i = 0; i < 4; i++) begin
             casez (vec[i*4 +: 4])
@@ -131,28 +166,27 @@ module lphy_ltssm_active (
         end
         if (g_val[0])      begin idx = {1'b0, g_idx[0]}; valid = 1'b1; end
         else if (g_val[1]) begin idx = {1'b1, g_idx[1]}; valid = 1'b1; end
-        else                begin idx = 4'd0; valid = 1'b0; end
+        else               begin idx = 4'd0; valid = 1'b0; end
     endfunction
 
     always_comb begin
         req_vec_steady = 16'd0;
-        req_vec_steady[WIN_DISABLE]      = rx_req_disable;
-        req_vec_steady[WIN_LINKRESET]    = rx_req_linkreset;
-        req_vec_steady[WIN_RETRAIN]      = rx_req_retrain;
-        req_vec_steady[WIN_L1]           = rx_req_l1;
-        req_vec_steady[WIN_L2]           = rx_req_l2;
-        req_vec_steady[WIN_LP_DISABLE]   = (lp_state_req == 4'b1100);
-        req_vec_steady[WIN_LP_LINKRESET] = (lp_state_req == 4'b1001);
-        req_vec_steady[WIN_LP_RETRAIN]   = (lp_state_req == 4'b1011) || internal_retrain_req;
-        req_vec_steady[WIN_LP_L1]        = (lp_state_req == 4'b0100);
-        req_vec_steady[WIN_LP_L2]        = (lp_state_req == 4'b1000);
+        // Evaluate strictly using the shielded registers
+        req_vec_steady[WIN_DISABLE]      = rx_req_disable_q;
+        req_vec_steady[WIN_LINKRESET]    = rx_req_linkreset_q;
+        req_vec_steady[WIN_RETRAIN]      = rx_req_retrain_q;
+        req_vec_steady[WIN_L1]           = rx_req_l1_q;
+        req_vec_steady[WIN_L2]           = rx_req_l2_q;
+        req_vec_steady[WIN_LP_DISABLE]   = (lp_state_req_q == 4'b1100);
+        req_vec_steady[WIN_LP_LINKRESET] = (lp_state_req_q == 4'b1001);
+        req_vec_steady[WIN_LP_RETRAIN]   = (lp_state_req_q == 4'b1011) || internal_retrain_req_q;
+        req_vec_steady[WIN_LP_L1]        = (lp_state_req_q == 4'b0100);
+        req_vec_steady[WIN_LP_L2]        = (lp_state_req_q == 4'b1000);
         find_first_one16(req_vec_steady, winner_idx, winner_valid);
     end
 
     // =========================================================================
-    // COMBINATIONAL DECISION (drives next_state directly -- unchanged timing
-    // contract for the internal FSM register -- and drives the pre-register
-    // "c_*" values that get pipelined below for external consumers)
+    // COMBINATIONAL DECISION 
     // =========================================================================
     logic c_tx_req_l1,        c_tx_rsp_l1;
     logic c_tx_req_l2,        c_tx_rsp_l2;
@@ -166,14 +200,6 @@ module lphy_ltssm_active (
     always_comb begin
         next_state = state;
         
-        // ARCHITECTURAL FIX: Scrambling must be continuously enabled for the ENTIRE DURATION 
-        // of en_active, regardless of the internal handshake sub-state.
-        scrambling_en = en_active; 
-        pl_state_sts  = en_active ? 4'b0001 : 4'b0000; 
-        
-        // Spec Compliance: Output 15h to Error Log 0 while ACTIVE
-        active_log    = en_active ? 8'h15 : 8'h00;
-        
         c_tx_req_l1 = 0; c_tx_rsp_l1 = 0;
         c_tx_req_l2 = 0; c_tx_rsp_l2 = 0;
         c_tx_req_linkreset = 0; c_tx_rsp_linkreset = 0;
@@ -185,11 +211,9 @@ module lphy_ltssm_active (
         c_exit_to_linkreset = 0; c_exit_to_disable = 0;
         c_exit_to_retrain = 0; c_exit_to_trainerror = 0;
         
-        if (en_active) begin
-            // -----------------------------------------------------------------
-            // FATAL ERROR OVERRIDE: Bypasses all handshakes immediately
-            // -----------------------------------------------------------------
-            if (lp_linkerror || internal_error_req || rx_req_linkerror) begin
+        if (en_active_q) begin
+            // Evaluate fatal overrides using the shielded registers
+            if (lp_linkerror_q || internal_error_req_q || rx_req_linkerror_q) begin
                 c_tx_req_linkerror   = 1'b1; 
                 c_exit_to_trainerror = 1'b1;
                 next_state           = ST_ACTIVE_STEADY;
@@ -197,16 +221,14 @@ module lphy_ltssm_active (
             else begin
                 case (state)
                     ST_ACTIVE_STEADY: begin
-                        // Winner resolved by the balanced priority tree above
-                        // (same priority order as the original if/else-if chain)
                         if (winner_valid) begin
                             next_state = (winner_idx <= WIN_L2) ? ST_EXITING : ST_WAIT_RSP;
                             case (winner_idx)
                                 WIN_DISABLE:      begin c_tx_rsp_disable   = 1; c_exit_to_disable   = 1; end
                                 WIN_LINKRESET:    begin c_tx_rsp_linkreset = 1; c_exit_to_linkreset = 1; end
                                 WIN_RETRAIN:      begin c_tx_rsp_retrain   = 1; c_exit_to_retrain   = 1; end
-                                WIN_L1:           begin c_tx_rsp_l1        = 1; c_exit_to_l1         = 1; end
-                                WIN_L2:           begin c_tx_rsp_l2        = 1; c_exit_to_l2         = 1; end
+                                WIN_L1:           begin c_tx_rsp_l1        = 1; c_exit_to_l1        = 1; end
+                                WIN_L2:           begin c_tx_rsp_l2        = 1; c_exit_to_l2        = 1; end
                                 WIN_LP_DISABLE:   begin c_tx_req_disable   = 1; end
                                 WIN_LP_LINKRESET: begin c_tx_req_linkreset = 1; end
                                 WIN_LP_RETRAIN:   begin c_tx_req_retrain   = 1; end
@@ -218,23 +240,21 @@ module lphy_ltssm_active (
                     end
                     
                     ST_WAIT_RSP: begin
-                        // Wait for the remote PHY to grant our request
-                        if      (target_exit_state == 4'b1100 && rx_rsp_disable)   begin c_exit_to_disable = 1;   next_state = ST_EXITING; end
-                        else if (target_exit_state == 4'b1001 && rx_rsp_linkreset) begin c_exit_to_linkreset = 1; next_state = ST_EXITING; end
-                        else if (target_exit_state == 4'b1011 && rx_rsp_retrain)   begin c_exit_to_retrain = 1;   next_state = ST_EXITING; end
-                        else if (target_exit_state == 4'b0100 && rx_rsp_l1)        begin c_exit_to_l1 = 1;        next_state = ST_EXITING; end
-                        else if (target_exit_state == 4'b1000 && rx_rsp_l2)        begin c_exit_to_l2 = 1;        next_state = ST_EXITING; end
+                        if      (target_exit_state == 4'b1100 && rx_rsp_disable_q)   begin c_exit_to_disable = 1;   next_state = ST_EXITING; end
+                        else if (target_exit_state == 4'b1001 && rx_rsp_linkreset_q) begin c_exit_to_linkreset = 1; next_state = ST_EXITING; end
+                        else if (target_exit_state == 4'b1011 && rx_rsp_retrain_q)   begin c_exit_to_retrain = 1;   next_state = ST_EXITING; end
+                        else if (target_exit_state == 4'b0100 && rx_rsp_l1_q)        begin c_exit_to_l1 = 1;        next_state = ST_EXITING; end
+                        else if (target_exit_state == 4'b1000 && rx_rsp_l2_q)        begin c_exit_to_l2 = 1;        next_state = ST_EXITING; end
                     end
                     
                     ST_EXITING: begin
-                        // Hold the exit flag continuously until the master LTSSM acknowledges and drops en_active
                         if      (target_exit_state == 4'b1100) c_exit_to_disable = 1'b1;
                         else if (target_exit_state == 4'b1001) c_exit_to_linkreset = 1'b1;
                         else if (target_exit_state == 4'b1011) c_exit_to_retrain = 1'b1;
                         else if (target_exit_state == 4'b0100) c_exit_to_l1 = 1'b1;
                         else if (target_exit_state == 4'b1000) c_exit_to_l2 = 1'b1;
 
-                        if (!en_active) next_state = ST_ACTIVE_STEADY;
+                        if (!en_active_q) next_state = ST_ACTIVE_STEADY;
                     end
                 endcase
             end
@@ -244,40 +264,79 @@ module lphy_ltssm_active (
     end
 
     // =========================================================================
-    // OUTPUT PIPELINE REGISTER
+    // 4. OUTPUT BOUNDARY SHIELD (Flop-Out)
+    // explicitly locked with dont_touch so Design Compiler cannot melt the boundaries
     // =========================================================================
-    // Breaks the combinational chain at the module boundary: external
-    // consumers (the top-level LTSSM's exit-routing logic, several module
-    // hops downstream) now see a clean register launch instead of the raw
-    // ripple from the priority tree above. This adds one clk of latency
-    // between a handshake decision and its external visibility; the
-    // "hold continuously during ST_EXITING" behavior is unaffected since
-    // these are level signals held for many cycles once asserted.
+    (* dont_touch = "true" *) logic tx_req_l1_q,        tx_rsp_l1_q;
+    (* dont_touch = "true" *) logic tx_req_l2_q,        tx_rsp_l2_q;
+    (* dont_touch = "true" *) logic tx_req_linkreset_q, tx_rsp_linkreset_q;
+    (* dont_touch = "true" *) logic tx_req_disable_q,   tx_rsp_disable_q;
+    (* dont_touch = "true" *) logic tx_req_retrain_q,   tx_rsp_retrain_q;
+    (* dont_touch = "true" *) logic tx_req_linkerror_q;
+    
+    (* dont_touch = "true" *) logic exit_to_l1_q, exit_to_l2_q;
+    (* dont_touch = "true" *) logic exit_to_linkreset_q, exit_to_disable_q;
+    (* dont_touch = "true" *) logic exit_to_retrain_q, exit_to_trainerror_q;
+    
+    (* dont_touch = "true" *) logic scrambling_en_q;
+    (* dont_touch = "true" *) logic [3:0] pl_state_sts_q;
+    (* dont_touch = "true" *) logic [7:0] active_log_q;
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tx_req_l1 <= 1'b0;        tx_rsp_l1 <= 1'b0;
-            tx_req_l2 <= 1'b0;        tx_rsp_l2 <= 1'b0;
-            tx_req_linkreset <= 1'b0; tx_rsp_linkreset <= 1'b0;
-            tx_req_disable <= 1'b0;   tx_rsp_disable <= 1'b0;
-            tx_req_retrain <= 1'b0;   tx_rsp_retrain <= 1'b0;
-            tx_req_linkerror <= 1'b0;
-            exit_to_l1 <= 1'b0; exit_to_l2 <= 1'b0;
-            exit_to_linkreset <= 1'b0; exit_to_disable <= 1'b0;
-            exit_to_retrain <= 1'b0; exit_to_trainerror <= 1'b0;
+            tx_req_l1_q <= 1'b0;        tx_rsp_l1_q <= 1'b0;
+            tx_req_l2_q <= 1'b0;        tx_rsp_l2_q <= 1'b0;
+            tx_req_linkreset_q <= 1'b0; tx_rsp_linkreset_q <= 1'b0;
+            tx_req_disable_q <= 1'b0;   tx_rsp_disable_q <= 1'b0;
+            tx_req_retrain_q <= 1'b0;   tx_rsp_retrain_q <= 1'b0;
+            tx_req_linkerror_q <= 1'b0;
+            exit_to_l1_q <= 1'b0; exit_to_l2_q <= 1'b0;
+            exit_to_linkreset_q <= 1'b0; exit_to_disable_q <= 1'b0;
+            exit_to_retrain_q <= 1'b0; exit_to_trainerror_q <= 1'b0;
+            scrambling_en_q <= 1'b0;
+            pl_state_sts_q <= 4'b0000;
+            active_log_q <= 8'h00;
         end else begin
-            tx_req_l1 <= c_tx_req_l1;               tx_rsp_l1 <= c_tx_rsp_l1;
-            tx_req_l2 <= c_tx_req_l2;               tx_rsp_l2 <= c_tx_rsp_l2;
-            tx_req_linkreset <= c_tx_req_linkreset; tx_rsp_linkreset <= c_tx_rsp_linkreset;
-            tx_req_disable <= c_tx_req_disable;     tx_rsp_disable <= c_tx_rsp_disable;
-            tx_req_retrain <= c_tx_req_retrain;     tx_rsp_retrain <= c_tx_rsp_retrain;
-            tx_req_linkerror <= c_tx_req_linkerror;
-            exit_to_l1 <= c_exit_to_l1;             exit_to_l2 <= c_exit_to_l2;
-            exit_to_linkreset <= c_exit_to_linkreset;
-            exit_to_disable <= c_exit_to_disable;
-            exit_to_retrain <= c_exit_to_retrain;
-            exit_to_trainerror <= c_exit_to_trainerror;
+            tx_req_l1_q <= c_tx_req_l1;               tx_rsp_l1_q <= c_tx_rsp_l1;
+            tx_req_l2_q <= c_tx_req_l2;               tx_rsp_l2_q <= c_tx_rsp_l2;
+            tx_req_linkreset_q <= c_tx_req_linkreset; tx_rsp_linkreset_q <= c_tx_rsp_linkreset;
+            tx_req_disable_q <= c_tx_req_disable;     tx_rsp_disable_q <= c_tx_rsp_disable;
+            tx_req_retrain_q <= c_tx_req_retrain;     tx_rsp_retrain_q <= c_tx_rsp_retrain;
+            tx_req_linkerror_q <= c_tx_req_linkerror;
+            exit_to_l1_q <= c_exit_to_l1;             exit_to_l2_q <= c_exit_to_l2;
+            exit_to_linkreset_q <= c_exit_to_linkreset;
+            exit_to_disable_q <= c_exit_to_disable;
+            exit_to_retrain_q <= c_exit_to_retrain;
+            exit_to_trainerror_q <= c_exit_to_trainerror;
+            scrambling_en_q <= en_active_q;
+            pl_state_sts_q <= en_active_q ? 4'b0001 : 4'b0000;
+            active_log_q <= en_active_q ? 8'h15 : 8'h00;
         end
     end
+
+    // Route purely from the locked registers
+    assign tx_req_l1        = tx_req_l1_q;
+    assign tx_rsp_l1        = tx_rsp_l1_q;
+    assign tx_req_l2        = tx_req_l2_q;
+    assign tx_rsp_l2        = tx_rsp_l2_q;
+    assign tx_req_linkreset = tx_req_linkreset_q;
+    assign tx_rsp_linkreset = tx_rsp_linkreset_q;
+    assign tx_req_disable   = tx_req_disable_q;
+    assign tx_rsp_disable   = tx_rsp_disable_q;
+    assign tx_req_retrain   = tx_req_retrain_q;
+    assign tx_rsp_retrain   = tx_rsp_retrain_q;
+    assign tx_req_linkerror = tx_req_linkerror_q;
+    
+    assign exit_to_l1         = exit_to_l1_q;
+    assign exit_to_l2         = exit_to_l2_q;
+    assign exit_to_linkreset  = exit_to_linkreset_q;
+    assign exit_to_disable    = exit_to_disable_q;
+    assign exit_to_retrain    = exit_to_retrain_q;
+    assign exit_to_trainerror = exit_to_trainerror_q;
+    
+    assign scrambling_en = scrambling_en_q;
+    assign pl_state_sts  = pl_state_sts_q;
+    assign active_log    = active_log_q;
 
 endmodule
 `default_nettype wire

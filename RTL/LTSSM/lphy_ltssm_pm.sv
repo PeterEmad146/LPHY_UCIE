@@ -5,38 +5,39 @@
 /// @description Orchestrates physical layer sleep states. Manages the wake-up 
 /// sideband handshakes initiated either locally by the Adapter or remotely by the 
 /// Link Partner, enforcing the 2us handshake timeout rule.
+/// (Optimized with a Pipelined Counter for 32nm 2GHz Timing Closure)
 module lphy_ltssm_pm #(
     // Number of cycles for 2us timeout. 
-    // Default: 100MHz clock (10ns) = 200 cycles.
-    parameter int TIMEOUT_2US_CYCLES = 200 
+    // At 2 GHz (0.5ns), 2us = 4000 cycles.
+    parameter int TIMEOUT_2US_CYCLES = 4000 
 )(
-    input  wire        clk, 
-    input  wire        rst_n,
+    input  wire         clk, 
+    input  wire         rst_n,
     
     // Entry Triggers from Master LTSSM
-    input  wire        en_l1, 
-    input  wire        en_l2, 
+    input  wire         en_l1, 
+    input  wire         en_l2, 
     
     // Adapter Interface (RDI) State Requests & Status
-    input  wire [3:0]  lp_state_req,        // Looking for 4'b0001 (Active) to initiate wake-up
-    output logic [3:0] pl_state_sts,        // Tell Adapter we are successfully asleep
-    output logic       pl_inband_pres,      // De-asserted during sleep
+    input  wire [3:0]   lp_state_req,       // Looking for 4'b0001 (Active) to initiate wake-up
+    output logic [3:0]  pl_state_sts,       // Tell Adapter we are successfully asleep
+    output logic        pl_inband_pres,     // De-asserted during sleep
     
     // Handshake Status Inputs from Sideband RX (1-Cycle Pulses)
-    input  wire        rx_req_active,       // Remote Link partner requesting PM exit
-    input  wire        rx_rsp_active,       // Remote Link partner acknowledging our wake-up
+    input  wire         rx_req_active,      // Remote Link partner requesting PM exit
+    input  wire         rx_rsp_active,      // Remote Link partner acknowledging our wake-up
     
     // Handshake Triggers to Sideband TX (1-Cycle Pulses)
-    output logic       tx_req_active, 
-    output logic       tx_rsp_active, 
+    output logic        tx_req_active, 
+    output logic        tx_rsp_active, 
     
     // Status Logging Output
-    output logic [7:0] pm_log,              // Output to Error Log 0 Register (17h)
+    output logic [7:0]  pm_log,             // Output to Error Log 0 Register (17h)
     
     // State Machine Exits
-    output logic       exit_to_speedidle,   // L1 wake-up routes to MBTRAIN.SPEEDIDLE
-    output logic       exit_to_reset,       // L2 wake-up routes to RESET
-    output logic       exit_to_trainerror   // 2us Timeout
+    output logic        exit_to_speedidle,  // L1 wake-up routes to MBTRAIN.SPEEDIDLE
+    output logic        exit_to_reset,      // L2 wake-up routes to RESET
+    output logic        exit_to_trainerror  // 2us Timeout
 );
 
     typedef enum logic [2:0] {
@@ -53,14 +54,23 @@ module lphy_ltssm_pm #(
     // Track which sleep state we are waking up from
     logic was_in_l2; 
     
-    // 2us Handshake Timeout Counter
+    // -------------------------------------------------------------------------
+    // PIPELINED COUNTER (Kills the 16-bit Ripple-Carry Delay)
+    // -------------------------------------------------------------------------
+    (* dont_touch = "true" *) logic [7:0] timeout_cnt_lo;
+    (* dont_touch = "true" *) logic [7:0] timeout_cnt_hi;
+    (* dont_touch = "true" *) logic       timeout_carry;
     logic [15:0] timeout_cnt;
+
+    assign timeout_cnt = {timeout_cnt_hi, timeout_cnt_lo};
     
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= ST_IDLE;
             was_in_l2 <= 1'b0;
-            timeout_cnt <= 16'd0;
+            timeout_cnt_lo  <= 8'd0;
+            timeout_cnt_hi  <= 8'd0;
+            timeout_carry   <= 1'b0;
         end else begin
             state <= next_state;
             
@@ -70,9 +80,16 @@ module lphy_ltssm_pm #(
             
             // 2us Timeout Timer (Active ONLY when waiting for remote response)
             if (state == ST_WAKE_REQ) begin
-                timeout_cnt <= timeout_cnt + 1'b1;
+                timeout_cnt_lo  <= timeout_cnt_lo + 1'b1;
+                timeout_carry   <= (timeout_cnt_lo == 8'hFF); // Trigger overflow
+                
+                if (timeout_carry) begin
+                    timeout_cnt_hi <= timeout_cnt_hi + 1'b1;
+                end
             end else begin
-                timeout_cnt <= 16'd0;
+                timeout_cnt_lo  <= 8'd0;
+                timeout_cnt_hi  <= 8'd0;
+                timeout_carry   <= 1'b0;
             end
         end
     end
@@ -135,7 +152,7 @@ module lphy_ltssm_pm #(
                 
                 if (rx_rsp_active) begin
                     next_state = ST_EXITING;
-                end else if (timeout_cnt >= TIMEOUT_2US_CYCLES) begin
+                end else if (timeout_cnt >= TIMEOUT_2US_CYCLES[15:0]) begin
                     // 2us rule violation!
                     next_state = ST_ERROR;
                 end

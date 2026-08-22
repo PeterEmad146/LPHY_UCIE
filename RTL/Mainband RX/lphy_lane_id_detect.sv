@@ -3,7 +3,7 @@
 
 /// @title UCIe RX Lane ID Detector (Data Lane Repair)
 /// @description Scans all physical lanes for the Per-Lane ID pattern.
-/// Flags lanes that fail to achieve 16 consecutive hits as broken.
+/// (Optimized with Boundary Control Shields for cross-hierarchy 2GHz Closure)
 module lphy_lane_id_detect #(
     parameter int NUM_LANES = 64 // 64 for Advanced Package, 16 for Standard Package
 )(
@@ -24,7 +24,23 @@ module lphy_lane_id_detect #(
 );
 
     // =========================================================================
-    // 1. Elaboration-Time Expected Pattern Generation
+    // 1. BOUNDARY CONTROL PIPELINE (Isolates LTSSM cross-module delay)
+    // =========================================================================
+    (* dont_touch = "true" *) logic en_lane_check_q;
+    (* dont_touch = "true" *) logic is_reversed_q;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            en_lane_check_q <= 1'b0;
+            is_reversed_q   <= 1'b0;
+        end else begin
+            en_lane_check_q <= en_lane_check;
+            is_reversed_q   <= is_reversed;
+        end
+    end
+
+    // =========================================================================
+    // 2. Elaboration-Time Expected Pattern Generation
     // =========================================================================
     logic [7:0] exp_norm_b0 [NUM_LANES - 1:0];
     logic [7:0] exp_norm_b1 [NUM_LANES - 1:0];
@@ -46,7 +62,7 @@ module lphy_lane_id_detect #(
     endgenerate
     
     // =========================================================================
-    // 2. Detection & Consecutive Hit Logic
+    // 3. Detection & Consecutive Hit Logic
     // =========================================================================
     logic [7:0] prev_byte [NUM_LANES-1:0];
     logic [7:0] cycle_cnt;
@@ -68,49 +84,42 @@ module lphy_lane_id_detect #(
         end else begin
             check_done <= 1'b0; // Default pulse to 0
 
-            if (en_lane_check && rx_lane_valid) begin
+            // Evaluates using the shielded internal registers!
+            if (en_lane_check_q && rx_lane_valid) begin
                 cycle_cnt <= cycle_cnt + 1'b1;
 
                 for (int i = 0; i < NUM_LANES; i++) begin
                     prev_byte[i] <= rx_lane_data_in[i];
 
-                    // Evaluate on every odd cycle (once 2 bytes are captured)
                     if (cycle_cnt[0] == 1'b1) begin
                         logic match;
-                        if (is_reversed) begin
+                        if (is_reversed_q) begin
                             match = (prev_byte[i] == exp_rev_b0[i] && rx_lane_data_in[i] == exp_rev_b1[i]);
                         end else begin
                             match = (prev_byte[i] == exp_norm_b0[i] && rx_lane_data_in[i] == exp_norm_b1[i]);
                         end
 
                         if (match) begin
-                            // Increment consecutive hits, capping at 16
                             if (consec_hits[i] < 5'd16) begin
                                 consec_hits[i] <= consec_hits[i] + 1'b1;
                             end
-                            // If we hit the 16th consecutive match, flag the lane as passed
                             if (consec_hits[i] == 5'd15) begin 
                                 lane_passed[i] <= 1'b1;
                             end
                         end else begin
-                            // A single bit error resets the consecutive counter
                             consec_hits[i] <= 5'd0; 
                         end
                     end
                 end
 
-                // Evaluate results after 128 iterations (256 clock cycles)
                 if (cycle_cnt == 8'hFF) begin
                     for (int i = 0; i < NUM_LANES; i++) begin
-                        // Lock in the failure mask. This holds its state permanently 
-                        // until another check overrides it.
                         lane_failed[i] <= ~lane_passed[i];
                     end
                     check_done <= 1'b1;
                 end
                 
-            end else if (!en_lane_check) begin
-                // Clear state when not testing, BUT LEAVE lane_failed ALONE!
+            end else if (!en_lane_check_q) begin
                 cycle_cnt <= 8'h00;
                 for (int i = 0; i < NUM_LANES; i++) begin
                     consec_hits[i] <= 5'd0;

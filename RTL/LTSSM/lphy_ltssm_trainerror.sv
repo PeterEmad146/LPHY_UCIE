@@ -3,8 +3,8 @@
 
 /// @title UCIe LTSSM Train Error State Controller (TRAINERROR)
 /// @description Orchestrates the graceful teardown of the physical link following 
-/// a fatal training or operational failure. Enforces the symmetric sideband handshake 
-/// and the 8ms unilateral timeout rule before returning to RESET.
+/// a fatal training or operational failure.
+/// (Optimized with Full I/O Boundary Shielding and Pipelined Counters for 2GHz)
 module lphy_ltssm_trainerror #(
     // Scaled down 8ms timeout for simulation
     parameter int TIMEOUT_CYCLES = 800000 
@@ -40,107 +40,167 @@ module lphy_ltssm_trainerror #(
         ST_DONE      = 3'h5
     } state_t;
 
-    state_t state, next_state;
-    logic [31:0] timeout_cnt;
+    state_t state, next_state, state_q;
+    
+    // =========================================================================
+    // 1. INPUT BOUNDARY SHIELD (Flop-In)
+    // =========================================================================
+    (* dont_touch = "true" *) logic en_trainerror_q;
+    (* dont_touch = "true" *) logic rx_trainerror_req_q;
+    (* dont_touch = "true" *) logic rx_trainerror_resp_q;
+    (* dont_touch = "true" *) logic rdi_in_linkerror_q;
     
     // Latches to catch 1-cycle sideband pulses
     logic rcvd_req;
     logic rcvd_resp;
 
+    // =========================================================================
+    // 2. PIPELINED COUNTER (Kills 32-bit Ripple-Carry Trap)
+    // =========================================================================
+    localparam logic [19:0] TARGET_CYCLES = 20'(TIMEOUT_CYCLES);
+
+    (* dont_touch = "true" *) logic [7:0] cnt_lo;
+    (* dont_touch = "true" *) logic [7:0] cnt_mid;
+    (* dont_touch = "true" *) logic [3:0] cnt_hi;
+    (* dont_touch = "true" *) logic       carry_lo;
+    (* dont_touch = "true" *) logic       carry_mid;
+    (* dont_touch = "true" *) logic       timeout_reached;
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state       <= ST_IDLE;
-            timeout_cnt <= 32'd0;
-            rcvd_req    <= 1'b0;
-            rcvd_resp   <= 1'b0;
+            state                <= ST_IDLE;
+            state_q              <= ST_IDLE;
+            en_trainerror_q      <= 1'b0;
+            rx_trainerror_req_q  <= 1'b0;
+            rx_trainerror_resp_q <= 1'b0;
+            rdi_in_linkerror_q   <= 1'b0;
+            rcvd_req             <= 1'b0;
+            rcvd_resp            <= 1'b0;
+            cnt_lo               <= '0;
+            cnt_mid              <= '0;
+            cnt_hi               <= '0;
+            carry_lo             <= 1'b0;
+            carry_mid            <= 1'b0;
+            timeout_reached      <= 1'b0;
         end else begin
-            state <= next_state;
+            // Absorb External Delays
+            en_trainerror_q      <= en_trainerror;
+            rx_trainerror_req_q  <= rx_trainerror_req;
+            rx_trainerror_resp_q <= rx_trainerror_resp;
+            rdi_in_linkerror_q   <= rdi_in_linkerror;
+
+            state   <= next_state;
+            state_q <= state;
             
-            // 8ms Timeout Counter (Active primarily during WAIT_RESP for Unilateral Safing)
-            if (state != next_state) begin
-                timeout_cnt <= 32'd0;
-            end else if (state == ST_WAIT_RESP) begin
-                if (timeout_cnt < TIMEOUT_CYCLES)
-                    timeout_cnt <= timeout_cnt + 1'b1;
-            end
-            
-            // Pulse Latching Logic
-            // Clear latches ONLY when transitioning back to IDLE
+            // Pulse Latching Logic (Evaluated strictly on the shielded signals)
             if (state != ST_IDLE && next_state == ST_IDLE) begin
                 rcvd_req  <= 1'b0;
                 rcvd_resp <= 1'b0;
             end else begin
-                // Always catch pulses, even while sitting in IDLE!
-                if (rx_trainerror_req)  rcvd_req  <= 1'b1;
-                if (rx_trainerror_resp) rcvd_resp <= 1'b1;
+                if (rx_trainerror_req_q)  rcvd_req  <= 1'b1;
+                if (rx_trainerror_resp_q) rcvd_resp <= 1'b1;
+            end
+
+            // Timer runs ONLY during ST_WAIT_RESP
+            if (state != state_q || state != ST_WAIT_RESP) begin
+                cnt_lo          <= '0;
+                cnt_mid         <= '0;
+                cnt_hi          <= '0;
+                carry_lo        <= 1'b0;
+                carry_mid       <= 1'b0;
+                timeout_reached <= 1'b0;
+            end else if (state == ST_WAIT_RESP) begin
+                if (!timeout_reached) begin
+                    cnt_lo   <= cnt_lo + 1'b1;
+                    carry_lo <= (cnt_lo == 8'hFF);
+                    
+                    if (carry_lo) begin
+                        cnt_mid   <= cnt_mid + 1'b1;
+                        carry_mid <= (cnt_mid == 8'hFF);
+                    end else carry_mid <= 1'b0;
+                    
+                    if (carry_mid) cnt_hi <= cnt_hi + 1'b1;
+                end
+
+                if ({cnt_hi, cnt_mid, cnt_lo} == TARGET_CYCLES) begin
+                    timeout_reached <= 1'b1;
+                end
             end
         end
     end
 
+    // =========================================================================
+    // 3. COMBINATIONAL NEXT-STATE & INTERNAL OUTPUTS
+    // =========================================================================
+    logic c_tx_trainerror_req, c_tx_trainerror_resp, c_exit_to_reset;
+    logic [7:0] c_trainerror_log;
+
     always_comb begin
-        next_state         = state;
-        tx_trainerror_req  = 1'b0;
-        tx_trainerror_resp = 1'b0;
-        exit_to_reset      = 1'b0;
+        next_state           = state;
+        c_tx_trainerror_req  = 1'b0;
+        c_tx_trainerror_resp = 1'b0;
+        c_exit_to_reset      = 1'b0;
+        c_trainerror_log     = (state != ST_IDLE) ? 8'h16 : 8'h00;
 
-        // Spec Compliance: Output 16h to Error Log 0
-        trainerror_log = (state != ST_IDLE) ? 8'h16 : 8'h00;
-
+        // Evaluate using ONLY the internal, registered signals
         case (state)
             ST_IDLE: begin
-                if (en_trainerror) begin
-                    // Evaluate latched requests in case pulse already passed while we were entering
-                    if (rx_trainerror_req || rcvd_req) next_state = ST_SEND_RESP;
+                if (en_trainerror_q) begin
+                    if (rx_trainerror_req_q || rcvd_req) next_state = ST_SEND_RESP;
                     else next_state = ST_SEND_REQ;
                 end
             end
 
-            // -------------------------------------------------------------
-            // LOCAL INITIATED FLOW (We escalated the error)
-            // -------------------------------------------------------------
             ST_SEND_REQ: begin
-                tx_trainerror_req = 1'b1;
+                c_tx_trainerror_req = 1'b1;
                 next_state = ST_WAIT_RESP;
             end
             
             ST_WAIT_RESP: begin
-                // Proceed if remote partner responds OR 8ms Unilateral Timeout expires
-                if (rx_trainerror_resp || rcvd_resp || (timeout_cnt == TIMEOUT_CYCLES)) begin
+                if (rx_trainerror_resp_q || rcvd_resp || timeout_reached) begin
                     next_state = ST_WAIT_RDI;
                 end 
-                // Crossover Deadlock Resolution: 
-                // If they asked us to error out while we were asking them, send a response and proceed!
-                else if (rx_trainerror_req || rcvd_req) begin
-                    tx_trainerror_resp = 1'b1;
+                else if (rx_trainerror_req_q || rcvd_req) begin
+                    c_tx_trainerror_resp = 1'b1;
                     next_state = ST_WAIT_RDI;
                 end
             end
 
-            // -------------------------------------------------------------
-            // REMOTE INITIATED FLOW (They escalated the error)
-            // -------------------------------------------------------------
             ST_SEND_RESP: begin
-                tx_trainerror_resp = 1'b1;
+                c_tx_trainerror_resp = 1'b1;
                 next_state = ST_WAIT_RDI;
             end
 
-            // -------------------------------------------------------------
-            // COMMON EXITS
-            // -------------------------------------------------------------
             ST_WAIT_RDI: begin
-                // Per Spec: Must hold in TRAINERROR as long as RDI is in LinkError.
-                if (!rdi_in_linkerror) begin
+                if (!rdi_in_linkerror_q) begin
                     next_state = ST_DONE;
                 end
             end
 
             ST_DONE: begin
-                exit_to_reset = 1'b1;
-                if (!en_trainerror) next_state = ST_IDLE;
+                c_exit_to_reset = 1'b1;
+                if (!en_trainerror_q) next_state = ST_IDLE;
             end
             
             default: next_state = ST_IDLE;
         endcase
+    end
+
+    // =========================================================================
+    // 4. OUTPUT BOUNDARY SHIELD (Flop-Out)
+    // =========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_trainerror_req  <= 1'b0;
+            tx_trainerror_resp <= 1'b0;
+            exit_to_reset      <= 1'b0;
+            trainerror_log     <= 8'h00;
+        end else begin
+            tx_trainerror_req  <= c_tx_trainerror_req;
+            tx_trainerror_resp <= c_tx_trainerror_resp;
+            exit_to_reset      <= c_exit_to_reset;
+            trainerror_log     <= c_trainerror_log;
+        end
     end
 endmodule
 `default_nettype wire

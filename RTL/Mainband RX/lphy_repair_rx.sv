@@ -146,42 +146,8 @@ module lphy_repair_rx (
     logic [5:0] fail_cnt_lower_full;   // FIX: full-width count, no wraparound
     logic [4:0] f0_l, f1_l;
     logic       f0_l_valid, f1_l_valid;
+    logic [7:0] rx_logical_data_comb [63:0];
 
-    always_comb begin
-        // Count (independent tree) and both failure indices (single parallel
-        // find-first-two tree -- no serial dependency between f0_l and f1_l)
-        fail_cnt_lower_full = popcount32(lane_failed[31:0]);
-        find_first_two(lane_failed[31:0], f0_l, f0_l_valid, f1_l, f1_l_valid);
-
-        // Default 1:1 Mapping
-        for (int i = 0; i < 32; i++) begin
-            rx_logical_data[i] = rx_physical_data[i];
-        end
-
-        if (fail_cnt_lower_full == 6'd1) begin
-            // Single Failure: Reconstruct shift-right mapping
-            rx_logical_data[0] = rx_redundant_data[0];    
-            for (int i = 1; i <= 31; i++) begin
-                if (i <= f0_l) begin
-                    rx_logical_data[i] = rx_physical_data[i-1];
-                end
-            end
-        end 
-        else if (fail_cnt_lower_full == 6'd2) begin
-            // Two Failures: Reconstruct split shift mapping
-            rx_logical_data[0]  = rx_redundant_data[0];   
-            rx_logical_data[31] = rx_redundant_data[1];  
-            
-            for (int i = 1; i <= 30; i++) begin
-                if (i <= f0_l) begin
-                    rx_logical_data[i] = rx_physical_data[i-1];
-                end else if (i >= f1_l) begin
-                    rx_logical_data[i] = rx_physical_data[i+1];
-                end
-            end
-        end
-    end
-    
     // =========================================================================
     // Group 2: Upper 32 Lanes (32 to 63) using Redundant [3:2]
     // =========================================================================
@@ -192,6 +158,11 @@ module lphy_repair_rx (
 
     always_comb begin
         // Count (independent tree) and both failure indices (single parallel
+        // find-first-two tree -- no serial dependency between f0_l and f1_l)
+        fail_cnt_lower_full = popcount32(lane_failed[31:0]);
+        find_first_two(lane_failed[31:0], f0_l, f0_l_valid, f1_l, f1_l_valid);
+
+        // Count (independent tree) and both failure indices (single parallel
         // find-first-two tree), relative to bit 0 of the upper half
         fail_cnt_upper_full = popcount32(lane_failed[63:32]);
         find_first_two(lane_failed[63:32], f0_u_raw, f0_u_valid, f1_u_raw, f1_u_valid);
@@ -200,33 +171,56 @@ module lphy_repair_rx (
         f0_u = {1'b0, f0_u_raw} + 6'd32;
         f1_u = {1'b0, f1_u_raw} + 6'd32;
 
-        // Default 1:1 mapping 
-        for (int i = 32; i < 64; i++) begin
-            rx_logical_data[i] = rx_physical_data[i];
+        // Default 1:1 mapping
+        for (int i = 0; i < 64; i++) begin
+            rx_logical_data_comb[i] = rx_physical_data[i];
         end
-        
-        if (fail_cnt_upper_full == 6'd1) begin
+
+        if (fail_cnt_lower_full == 6'd1) begin
             // Single Failure: Reconstruct shift-right mapping
-            rx_logical_data[32] = rx_redundant_data[2];  
-            for (int i = 33; i <= 63; i++) begin
-                if (i <= f0_u) begin
-                    rx_logical_data[i] = rx_physical_data[i-1];
+            rx_logical_data_comb[0] = rx_redundant_data[0];
+            for (int i = 1; i <= 31; i++) begin
+                if (i <= f0_l) begin
+                    rx_logical_data_comb[i] = rx_physical_data[i-1];
                 end
             end
-        end 
-        else if (fail_cnt_upper_full == 6'd2) begin
+        end else if (fail_cnt_lower_full == 6'd2) begin
             // Two Failures: Reconstruct split shift mapping
-            rx_logical_data[32] = rx_redundant_data[2]; 
-            rx_logical_data[63] = rx_redundant_data[3]; 
-            
+            rx_logical_data_comb[0] = rx_redundant_data[0];
+            rx_logical_data_comb[31] = rx_redundant_data[1];
+
+            for (int i = 1; i <= 30; i++) begin
+                if (i <= f0_l) begin
+                    rx_logical_data_comb[i] = rx_physical_data[i-1];
+                end else if (i >= f1_l) begin
+                    rx_logical_data_comb[i] = rx_physical_data[i+1];
+                end
+            end
+        end
+
+        if (fail_cnt_upper_full == 6'd1) begin
+            // Single Failure: Reconstruct shift-right mapping
+            rx_logical_data_comb[32] = rx_redundant_data[2];
+            for (int i = 33; i <= 63; i++) begin
+                if (i <= f0_u) begin
+                    rx_logical_data_comb[i] = rx_physical_data[i-1];
+                end
+            end
+        end else if (fail_cnt_upper_full == 6'd2) begin
+            // Two Failures: Reconstruct split shift mapping
+            rx_logical_data_comb[32] = rx_redundant_data[2];
+            rx_logical_data_comb[63] = rx_redundant_data[3];
+
             for (int i = 33; i <= 62; i++) begin
                 if (i <= f0_u) begin
-                    rx_logical_data[i] = rx_physical_data[i-1];
+                    rx_logical_data_comb[i] = rx_physical_data[i-1];
                 end else if (i >= f1_u) begin
-                    rx_logical_data[i] = rx_physical_data[i+1];
+                    rx_logical_data_comb[i] = rx_physical_data[i+1];
                 end
-            end 
+            end
         end
+
+        rx_logical_data = rx_logical_data_comb;
     end
 
     // =========================================================================

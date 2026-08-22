@@ -3,7 +3,7 @@
 
 /// @title UCIe Raw Die-to-Die Interface (RDI)
 /// @description Standardized logical boundary between the D2D Adapter and the Logical PHY.
-/// Decouples the upper protocol layers from the physical analog macros.
+/// (Optimized with a Hard RDI Firewall to absorb top-level SoC I/O delays at 2GHz)
 module lphy_rdi_intf #(
     parameter int NBYTES = 16, // Mainband data width in bytes (e.g., 16 = 128-bit)
     parameter int NC     = 32  // Sideband data width in bits (8, 16, or 32)
@@ -106,21 +106,73 @@ module lphy_rdi_intf #(
 );
 
     // -------------------------------------------------------------------------
-    // Direct Passthrough Assignments (State & Errors)
+    // RDI INPUT FIREWALL (Kills 0.20ns SDC Input Delay Penalty)
     // -------------------------------------------------------------------------
-    assign internal_lp_state_req = lp_state_req;
-    assign internal_lp_linkerror = lp_linkerror;
-    
-    assign pl_state_sts          = internal_pl_state_sts;
-    assign pl_inband_pres        = internal_pl_inband_pres;
-    assign pl_speedmode          = internal_speedmode;
-    assign pl_lnk_cfg            = internal_lnk_cfg;
+    (* dont_touch = "true" *) logic [3:0] lp_state_req_q;
+    (* dont_touch = "true" *) logic       lp_linkerror_q;
 
-    assign pl_error              = internal_error;
-    assign pl_cerror             = internal_cerror;
-    assign pl_nferror            = internal_nferror;
-    assign pl_trainerror         = internal_trainerror;
-    assign pl_phyinrecenter      = internal_phyinrecenter;
+    always_ff @(posedge lclk or negedge rst_n) begin
+        if (!rst_n) begin
+            lp_state_req_q <= 4'b0000; 
+            lp_linkerror_q <= 1'b0;
+        end else begin
+            lp_state_req_q <= lp_state_req;
+            lp_linkerror_q <= lp_linkerror;
+        end
+    end
+
+    assign internal_lp_state_req = lp_state_req_q;
+    assign internal_lp_linkerror = lp_linkerror_q;
+    
+    // -------------------------------------------------------------------------
+    // RDI OUTPUT FIREWALL (Kills 0.20ns SDC Output Delay Penalty)
+    // -------------------------------------------------------------------------
+    // Flop the status signals before they leave the PHY to completely decouple
+    // internal combinatorial paths from the external SoC routing delays.
+    (* dont_touch = "true" *) logic [3:0] pl_state_sts_q;
+    (* dont_touch = "true" *) logic       pl_inband_pres_q;
+    (* dont_touch = "true" *) logic       pl_error_q;
+    (* dont_touch = "true" *) logic       pl_cerror_q;
+    (* dont_touch = "true" *) logic       pl_nferror_q;
+    (* dont_touch = "true" *) logic       pl_trainerror_q;
+    (* dont_touch = "true" *) logic       pl_phyinrecenter_q;
+    (* dont_touch = "true" *) logic [2:0] pl_speedmode_q;
+    (* dont_touch = "true" *) logic [2:0] pl_lnk_cfg_q;
+
+    always_ff @(posedge lclk or negedge rst_n) begin
+        if (!rst_n) begin
+            pl_state_sts_q     <= 4'b0000;
+            pl_inband_pres_q   <= 1'b0;
+            pl_error_q         <= 1'b0;
+            pl_cerror_q        <= 1'b0;
+            pl_nferror_q       <= 1'b0;
+            pl_trainerror_q    <= 1'b0;
+            pl_phyinrecenter_q <= 1'b0;
+            pl_speedmode_q     <= 3'b000;
+            pl_lnk_cfg_q       <= 3'b000;
+        end else begin
+            pl_state_sts_q     <= internal_pl_state_sts;
+            pl_inband_pres_q   <= internal_pl_inband_pres;
+            pl_error_q         <= internal_error;
+            pl_cerror_q        <= internal_cerror;
+            pl_nferror_q       <= internal_nferror;
+            pl_trainerror_q    <= internal_trainerror;
+            pl_phyinrecenter_q <= internal_phyinrecenter;
+            pl_speedmode_q     <= internal_speedmode;
+            pl_lnk_cfg_q       <= internal_lnk_cfg;
+        end
+    end
+
+    // Route the clean, 0.00ns-arrival registered signals out to the D2D Adapter
+    assign pl_state_sts     = pl_state_sts_q;
+    assign pl_inband_pres   = pl_inband_pres_q;
+    assign pl_error         = pl_error_q;
+    assign pl_cerror        = pl_cerror_q;
+    assign pl_nferror       = pl_nferror_q;
+    assign pl_trainerror    = pl_trainerror_q;
+    assign pl_phyinrecenter = pl_phyinrecenter_q;
+    assign pl_speedmode     = pl_speedmode_q;
+    assign pl_lnk_cfg       = pl_lnk_cfg_q;
 
     // -------------------------------------------------------------------------
     // Direct Passthrough Assignments (Datapath & Sideband)
@@ -146,15 +198,11 @@ module lphy_rdi_intf #(
     // -------------------------------------------------------------------------
     // Link Training Trigger Synthesis
     // -------------------------------------------------------------------------
-    // Translates the Adapter's request to exit Reset into a single cycle pulse 
-    // to kick off the internal PHY SBINIT sequence.
-    assign internal_start_link_training = (internal_pl_state_sts == 4'b0000) && (lp_state_req == 4'b0001);
+    assign internal_start_link_training = (internal_pl_state_sts == 4'b0000) && (lp_state_req_q == 4'b0001);
 
     // -------------------------------------------------------------------------
     // Clock Gating Handshakes (UCIe Spec Section 8.1.3)
     // -------------------------------------------------------------------------
-    // Rule: If dynamic clock gating is not supported by the PHY, it must stage
-    // lp_wake_req internally for one or more clock cycles and turn it around as pl_wake_ack.
     logic wake_req_q1, wake_req_q2;
     always_ff @(posedge lclk or negedge rst_n) begin
         if (!rst_n) begin
@@ -167,14 +215,11 @@ module lphy_rdi_intf #(
     end
     assign pl_wake_ack = wake_req_q2;
 
-    // Bypass dynamic clock gating complexity on the Adapter side for this implementation
     assign pl_clk_req = 1'b1; 
 
     // -------------------------------------------------------------------------
     // Stall Handshake (UCIe Spec Section 8.3.1)
     // -------------------------------------------------------------------------
-    // Rule 8: The logic path between pl_stallreq and lp_stallack must contain at 
-    // least one flop to prevent a combinatorial loop.
     logic stallreq_q;
     logic stallack_q;
 
@@ -183,10 +228,7 @@ module lphy_rdi_intf #(
             stallreq_q <= 1'b0;
             stallack_q <= 1'b0;
         end else begin
-            // Forward internal PHY stall request up to Adapter
             stallreq_q <= internal_stallreq;
-            
-            // Capture Adapter's stall ack and safely route it down to PHY LTSSM
             stallack_q <= lp_stallack;
         end
     end

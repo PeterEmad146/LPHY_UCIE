@@ -62,9 +62,8 @@ module lphy_rx_top #(
     // Power up AFE receivers automatically when out of reset
     assign rx_en = 1'b1; 
     
-    // Suppress lint warnings for unused analog clock pins
-    logic _unused;
-    assign _unused = ^{RXTRK};
+    // RXTRK is intentionally left unconnected at this boundary to avoid
+    // creating a dummy internal signal that would trigger "never read" lint.
 
     // Internal pipeline signals
     logic [7:0] rx_lane_data_64 [63:0]; 
